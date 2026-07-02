@@ -14,6 +14,10 @@ runs:
   steps:
     - shell: bash
       working-directory: ${{ github.action_path }}
+      # Untrusted inputs travel through env, never interpolated into the run: text (see actions/lint).
+      env:
+        TEST_SUITE: ${{ inputs.suite }}
+        TEST_COVERAGE: ${{ inputs.coverage }}
       run: bazelisk run //actions/test --
-        --suite='${{ inputs.suite }}'
-        --coverage='${{ inputs.coverage }}'
+        --suite="$TEST_SUITE"
+        --coverage="$TEST_COVERAGE"

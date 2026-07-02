@@ -12,7 +12,25 @@ type Consumer struct {
 	Ref  string `json:"ref"`
 }
 
-var repoRe = regexp.MustCompile(`^[^/\s]+/[^/\s]+$`)
+// repoRe is deliberately strict: GitHub owner/repo names are [A-Za-z0-9._-] only. The old
+// `[^/\s]+` allowed shell metacharacters (`;`, `|`, `$`, backtick), and consumer.repo is
+// interpolated into a bazelisk `run:` arg in shadow.yaml — a loose value would be a command-
+// injection sink on the provider runner.
+var repoRe = regexp.MustCompile(`^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$`)
+
+// MaxShadowConsumers is GitHub's hard cap on jobs in one matrix. Past it the whole shadow workflow
+// fails at expansion ("Matrix must not have more than 256 jobs"), so we reject earlier with a
+// clear message. Shadow testing is a representative sample of the fleet, not the whole fleet — if
+// you need more coverage, shard the consumers file across workflows.
+const MaxShadowConsumers = 256
+
+// CheckMatrixLimit fails if there are too many consumers to expand into a single GitHub matrix.
+func CheckMatrixLimit(n int) error {
+	if n > MaxShadowConsumers {
+		return fmt.Errorf("%d consumers exceeds GitHub's %d-job matrix limit; shard shadow-consumers.json", n, MaxShadowConsumers)
+	}
+	return nil
+}
 
 // ParseConsumers parses + validates the workflows' shadow-consumers.json. ref defaults to "main".
 func ParseConsumers(jsonStr string) ([]Consumer, error) {

@@ -26,7 +26,7 @@ func ReferencesWorkflowsRepo(yamlText, workflowsRepo string) (bool, error) {
 		if uses == nil || uses.Kind != yaml.ScalarNode {
 			continue
 		}
-		if m := reusableUses.FindStringSubmatch(uses.Value); m != nil && m[1] == workflowsRepo {
+		if m := reusableUses.FindStringSubmatch(uses.Value); m != nil && strings.EqualFold(m[1], workflowsRepo) {
 			return true, nil
 		}
 	}
@@ -55,18 +55,27 @@ func PatchConsumerWorkflow(yamlText, workflowsRepo, workflowsRef string) (string
 			continue
 		}
 		m := reusableUses.FindStringSubmatch(uses.Value)
-		if m == nil || m[1] != workflowsRepo {
+		if m == nil || !strings.EqualFold(m[1], workflowsRepo) {
 			continue
 		}
-		path := m[2]
+		// Preserve the consumer's own owner/repo casing (GitHub is case-insensitive) — only the ref
+		// after @ is rewritten.
+		repo, path := m[1], m[2]
 		if strings.HasSuffix(path, ".yml") { // fix the .yml -> .yaml typo
 			path = strings.TrimSuffix(path, ".yml") + ".yaml"
 		}
-		*uses = yaml.Node{Kind: yaml.ScalarNode, Value: workflowsRepo + "/" + path + "@" + workflowsRef}
+		*uses = yaml.Node{Kind: yaml.ScalarNode, Value: repo + "/" + path + "@" + workflowsRef}
 
-		if with := mapGet(job, "with"); with != nil && with.Kind == yaml.MappingNode {
+		switch with := mapGet(job, "with"); {
+		case with != nil && with.Kind == yaml.MappingNode:
 			mapSetScalar(with, "ref", workflowsRef)
-		} else {
+		case with != nil && with.Kind == yaml.AliasNode && with.Alias != nil && with.Alias.Kind == yaml.MappingNode:
+			// `with: *anchor` — copy the anchored inputs into a fresh mapping (never mutate the
+			// shared anchor) and override ref, so the consumer's inputs survive the repoint.
+			merged := &yaml.Node{Kind: yaml.MappingNode, Content: append([]*yaml.Node{}, with.Alias.Content...)}
+			mapSetScalar(merged, "ref", workflowsRef)
+			mapSetNode(job, "with", merged)
+		default:
 			mapSetNode(job, "with", &yaml.Node{
 				Kind:    yaml.MappingNode,
 				Content: []*yaml.Node{scalarNode("ref"), scalarNode(workflowsRef)},

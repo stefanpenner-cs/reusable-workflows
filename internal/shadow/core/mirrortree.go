@@ -27,10 +27,24 @@ func MirrorTree(src, dest string) error {
 		if d.IsDir() {
 			return os.MkdirAll(target, 0o755)
 		}
+		// Recreate symlinks as links (never dereference — a dir symlink would break os.ReadFile and
+		// abort the whole mirror; a file symlink would silently become a copy).
+		if d.Type()&fs.ModeSymlink != 0 {
+			link, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(link, target)
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		return os.WriteFile(target, data, 0o644)
+		// Preserve the exec bit — consumer CI often runs mirrored scripts directly.
+		return os.WriteFile(target, data, info.Mode().Perm())
 	})
 }

@@ -102,6 +102,31 @@ func TestPatchPreservesComments(t *testing.T) {
 	assert.Contains(t, out, "# call the shared workflow")
 }
 
+func TestPatchMatchesRepoCaseInsensitively(t *testing.T) {
+	// GitHub owner/repo names are case-insensitive; a consumer that writes a different case must
+	// still be repointed, else the shadow test silently validates the OLD ref (false pass).
+	in := "jobs:\n  ci:\n    uses: StefanPenner-CS/Reusable-Workflows/.github/workflows/shared.yaml@v1\n"
+	out := parseYAML(t, patch(t, in))
+	assert.Equal(t, "StefanPenner-CS/Reusable-Workflows/.github/workflows/shared.yaml@"+sha, nav(out, "jobs", "ci", "uses"))
+	assert.Equal(t, sha, nav(out, "jobs", "ci", "with", "ref"))
+}
+
+func TestReferencesWorkflowsRepoCaseInsensitive(t *testing.T) {
+	mixed := "jobs:\n  ci:\n    uses: StefanPenner-CS/Reusable-Workflows/.github/workflows/shared.yaml@main\n"
+	ok, err := ReferencesWorkflowsRepo(mixed, workflowsRepo)
+	require.NoError(t, err)
+	assert.True(t, ok)
+}
+
+func TestPatchPreservesAnchoredWithInputs(t *testing.T) {
+	// `with: *anchor` is an alias node; the ref override must NOT wipe the anchored inputs.
+	in := "x-common: &common\n  project-name: my-app\njobs:\n  ci:\n    uses: stefanpenner-cs/reusable-workflows/.github/workflows/shared.yaml@main\n    with: *common\n"
+	out := parseYAML(t, patch(t, in))
+	with := nav(out, "jobs", "ci", "with").(map[string]any)
+	assert.Equal(t, "my-app", with["project-name"], "anchored inputs must survive")
+	assert.Equal(t, sha, with["ref"])
+}
+
 func TestReferencesWorkflowsRepo(t *testing.T) {
 	yes := "jobs:\n  ci:\n    uses: stefanpenner-cs/reusable-workflows/.github/workflows/shared.yaml@main\n"
 	ok, err := ReferencesWorkflowsRepo(yes, workflowsRepo)

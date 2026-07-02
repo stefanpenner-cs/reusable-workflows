@@ -23,6 +23,34 @@ func TestMirrorTreeCopiesRecursively(t *testing.T) {
 	assert.FileExists(t, filepath.Join(dest, ".github", "workflows", "ci.yaml"))
 }
 
+func TestMirrorTreePreservesExecBit(t *testing.T) {
+	// A consumer's CI often invokes ./scripts/build.sh directly; dropping the exec bit → "permission
+	// denied" → false shadow failure.
+	src, dest := t.TempDir(), t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(src, "build.sh"), []byte("#!/bin/sh\n"), 0o755))
+
+	require.NoError(t, MirrorTree(src, dest))
+
+	info, err := os.Stat(filepath.Join(dest, "build.sh"))
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o755), info.Mode().Perm())
+}
+
+func TestMirrorTreeHandlesSymlinks(t *testing.T) {
+	// A symlink (even to a directory) must be recreated as a link, not dereferenced — os.ReadFile on
+	// a dir symlink errors and aborts the whole mirror.
+	src, dest := t.TempDir(), t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "real"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "real", "f"), []byte("x"), 0o644))
+	require.NoError(t, os.Symlink("real", filepath.Join(src, "link")))
+
+	require.NoError(t, MirrorTree(src, dest))
+
+	target, err := os.Readlink(filepath.Join(dest, "link"))
+	require.NoError(t, err)
+	assert.Equal(t, "real", target)
+}
+
 func TestMirrorTreeNeverCopiesGit(t *testing.T) {
 	src, dest := t.TempDir(), t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(src, ".git"), 0o755))

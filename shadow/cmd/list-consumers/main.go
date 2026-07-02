@@ -37,6 +37,9 @@ func main() {
 			if err != nil {
 				return err
 			}
+			if err := core.CheckMatrixLimit(len(consumers)); err != nil {
+				return err
+			}
 			matrix, err := json.Marshal(consumers)
 			if err != nil {
 				return err
