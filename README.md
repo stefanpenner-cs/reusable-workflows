@@ -86,11 +86,18 @@ Use it from any repo:
 ```yaml
 jobs:
   ci:
-    uses: stefanpenner-cs/reusable-workflows/.github/workflows/shared.yaml@main
+    uses: stefanpenner-cs/reusable-workflows/.github/workflows/shared.yaml@v1
     with:
-      ref: main # required: which version of the actions to fetch
+      channel: stable # which release track to follow (default: stable)
       project-name: my-app # optional
 ```
+
+The version each consumer runs is chosen by the **rollout control plane**
+([`.github/rollout.json`](.github/rollout.json)), not pinned per-repo — so a
+change ramps across the fleet, then promotes or rolls back, from a single commit.
+A consumer can still pin explicitly with `ref: <tag|sha>` (bypasses the channel).
+See **[`ROLLOUT.md`](ROLLOUT.md)** for the release → ramp → watch → rollback
+runbook.
 
 `shadow/` pre-merge-tests this repo's own changes against real consumers — see
 [`shadow/README.md`](shadow/README.md). Repo conventions (no inline scripts, Go + Bazel, lint,
@@ -98,8 +105,9 @@ CLI args, TDD) live in [`CLAUDE.md`](CLAUDE.md).
 
 ## Caveats
 
-- **Pass an explicit `ref`.** `github.job_workflow_sha` is empty in some contexts (e.g.
-  `workflow_dispatch` self-tests), so the caller pins the version via the `ref` input.
+- **Version is chosen by channel, not a required `ref`.** Consumers pass `channel:` and the
+  rollout manifest resolves the ref; the resolve step fails loudly on an unknown channel or missing
+  manifest (no silent drift to `main`). Pass `ref:` only to pin/override.
 - **Keep the `./` prefix** on action paths — without it GHA reads the path as `org/repo@ref`.
 - **Private provider repo:** give `checkout-anywhere` a token with `contents: read`
   (`token: ${{ secrets.PROVIDER_REPO_TOKEN }}`), or enable org-wide Actions access so the caller's

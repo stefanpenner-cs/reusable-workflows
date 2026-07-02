@@ -3,9 +3,23 @@ name: Shared Workflow
 on:
   workflow_call:
     inputs:
+      # channel selects the release track (see .github/rollout.json). The rollout control plane —
+      # not each consumer — decides which provider ref this repo runs, so a fleet-wide ramp or
+      # rollback is a single commit to the manifest, picked up here on the next run.
+      channel:
+        type: string
+        default: stable
+      # ref is an explicit override / pin: when set it bypasses the channel entirely (escape hatch
+      # for a repo that must stay on a specific version). Empty = follow the channel.
       ref:
         type: string
-        required: true
+        required: false
+        default: ""
+      # bootstrap-ref is where the control plane (rollout.json + the resolver) is read from. It is
+      # intentionally a moving pointer (main) — that is how ramp/rollback propagate to the fleet.
+      bootstrap-ref:
+        type: string
+        default: main
       project-name:
         type: string
         default: my-project
@@ -13,26 +27,50 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      # Check this repo's actions out OUTSIDE the workspace (../_reusable-workflows), so they never
-      # show in the consumer's git status — no .git/info/exclude needed — then reference them via
-      # traversal `uses: ./../_reusable-workflows/...`. The checkout action is pinned to a literal
-      # ref (a `uses:` ref can't be an expression); it checks the provider out at the `ref` input.
-      - name: Set up shared actions
+      # Phase 1 — check out the control plane (this repo at bootstrap-ref) OUTSIDE the workspace, so
+      # the resolver + rollout.json are on disk without polluting the consumer's git status.
+      - name: Set up rollout control plane
         uses: stefanpenner/checkout-anywhere@v1
         with:
           repository: stefanpenner-cs/reusable-workflows
-          ref: ${{ inputs.ref || 'main' }}
-          path: ../_reusable-workflows
+          ref: ${{ inputs.bootstrap-ref }}
+          path: ../_rw-control
 
-      # The actions are Go binaries built on demand by Bazel (each `run:` is `bazelisk run //…`).
-      # Install + cache bazelisk here so the first action pays a warm build, not a cold one.
+      # The resolver + actions are Go binaries built on demand by Bazel. Install + cache bazelisk
+      # here so both the resolve step and the first action pay a warm build.
       - name: Set up Bazel
         uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
           disk-cache: true
           repository-cache: true
+
+      # Resolve which provider ref THIS repo runs for the channel. Untrusted-ish inputs (the caller
+      # repo, channel, override) travel through env, never interpolated into the run: text.
+      - name: Resolve rollout ref
+        id: resolve
+        working-directory: ${{ github.workspace }}/../_rw-control
+        env:
+          RW_CHANNEL: ${{ inputs.channel }}
+          RW_REPO: ${{ github.repository }}
+          RW_REF: ${{ inputs.ref }}
+        run: bazelisk run //rollout/cmd/resolve --
+          --manifest=.github/rollout.json
+          --channel="$RW_CHANNEL"
+          --repo="$RW_REPO"
+          --ref="$RW_REF"
+
+      # Phase 2 — check out the actions at the RESOLVED ref (a pinned tag/SHA for most repos). This
+      # is the version that actually runs; the control plane above chose it.
+      - name: Set up shared actions
+        uses: stefanpenner/checkout-anywhere@v1
+        with:
+          repository: stefanpenner-cs/reusable-workflows
+          ref: ${{ steps.resolve.outputs.ref }}
+          path: ../_reusable-workflows
 
       - name: Debug
         uses: ./../_reusable-workflows/actions/debug

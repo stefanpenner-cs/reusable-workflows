@@ -6,8 +6,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   shared:
+    # Self-test: pin the actions to this exact commit via the explicit `ref` override (bypasses the
+    # channel) so CI exercises the code under test, not whatever the channel currently points at.
     uses: ./.github/workflows/shared.yaml
     with:
-      ref: ${{ github.sha || '--non-existent-ref--'}}
+      ref: ${{ github.sha }}

@@ -1,0 +1,10 @@
+{
+  "channels": {
+    "canary": {
+      "ref": "main"
+    },
+    "stable": {
+      "ref": "main"
+    }
+  }
+}
