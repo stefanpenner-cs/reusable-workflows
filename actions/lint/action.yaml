@@ -14,6 +14,13 @@ runs:
   steps:
     - shell: bash
       working-directory: ${{ github.action_path }}
+      # Untrusted inputs travel through env, never interpolated into the run: text — a value with a
+      # quote/`;`/`$()` would otherwise break out of the command (GHA substitutes ${{ }} before the
+      # shell parses). The shell expands "$VAR" without re-parsing, and the Go binary still gets a
+      # named flag (CLAUDE.md rule #4).
+      env:
+        LINT_PATHS: ${{ inputs.paths }}
+        LINT_CONFIG: ${{ inputs.config }}
       run: bazelisk run //actions/lint --
-        --paths='${{ inputs.paths }}'
-        --config='${{ inputs.config }}'
+        --paths="$LINT_PATHS"
+        --config="$LINT_CONFIG"

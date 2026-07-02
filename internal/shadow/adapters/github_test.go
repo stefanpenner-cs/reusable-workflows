@@ -117,6 +117,93 @@ func TestWatchCommitRun(t *testing.T) {
 	assert.NoError(t, watchCommitRun(testClient(t, mux), "o/runner", "deadbeef", 3, 0, 3, 0))
 }
 
+func TestWatchCommitRunFailsIfAnyRunFails(t *testing.T) {
+	// A consumer with two workflows produces two runs for the shadow commit. If the shared-workflow
+	// run fails, the check must FAIL even if the other run passed — never pick just runs[0].
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/runner/actions/runs", func(w http.ResponseWriter, _ *http.Request) {
+		json200(w, map[string]any{"total_count": 2, "workflow_runs": []map[string]any{{"id": 1}, {"id": 2}}})
+	})
+	mux.HandleFunc("/repos/o/runner/actions/runs/1", func(w http.ResponseWriter, _ *http.Request) {
+		json200(w, map[string]any{"status": "completed", "conclusion": "success"})
+	})
+	mux.HandleFunc("/repos/o/runner/actions/runs/2", func(w http.ResponseWriter, _ *http.Request) {
+		json200(w, map[string]any{"status": "completed", "conclusion": "failure"})
+	})
+	err := watchCommitRun(testClient(t, mux), "o/runner", "deadbeef", 3, 0, 3, 0)
+	assert.ErrorContains(t, err, "failure")
+}
+
+func TestAwaitRunRetriesTransientError(t *testing.T) {
+	// One transient 500 then success must NOT false-fail the shadow check.
+	var calls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/runner/actions/runs/42", func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		json200(w, map[string]any{"status": "completed", "conclusion": "success"})
+	})
+	assert.NoError(t, awaitRun(testClient(t, mux), "o/runner", 42, "run", 5, 0))
+}
+
+func TestAwaitRunReturnsAuthErrorNotTimeout(t *testing.T) {
+	// A hard 401 must surface as an auth error immediately, not burn the budget into a misleading
+	// "timed out" message.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/runner/actions/runs/42", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	err := awaitRun(testClient(t, mux), "o/runner", 42, "run", 5, 0)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "timed out")
+}
+
+func TestEnsurePRRecoversFrom422(t *testing.T) {
+	// Concurrent shadow runs race to create the same-branch PR; the loser gets 422 already-exists
+	// and must re-fetch the winner's PR rather than false-fail.
+	var gets int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/runner/pulls", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			gets++
+			if gets == 1 {
+				json200(w, []any{}) // first check: none yet
+				return
+			}
+			json200(w, []map[string]any{{"html_url": "https://github.com/o/runner/pull/7"}}) // now the winner's
+			return
+		}
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"message":"Validation Failed","errors":[{"resource":"PullRequest","message":"A pull request already exists for o:shadow/x."}]}`))
+	})
+	u, err := ensurePR(testClient(t, mux), "o/runner", "shadow/x", "main", "t", "b")
+	require.NoError(t, err)
+	assert.Equal(t, "https://github.com/o/runner/pull/7", u)
+}
+
+func TestClosePRAndDeleteBranchToleratesMissingBranch(t *testing.T) {
+	// Already-deleted branch (404/422 on DeleteRef) is fine — cleanup must still succeed.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/runner/pulls", func(w http.ResponseWriter, _ *http.Request) { json200(w, []any{}) })
+	mux.HandleFunc("/repos/o/runner/git/refs/heads/shadow/x", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+	})
+	assert.NoError(t, closePRAndDeleteBranch(testClient(t, mux), "o/runner", "shadow/x"))
+}
+
+func TestClosePRAndDeleteBranchReturnsRealError(t *testing.T) {
+	// A 401 (expired PAT) must NOT be swallowed — otherwise cleanup goes green having leaked
+	// everything.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/o/runner/pulls", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	assert.Error(t, closePRAndDeleteBranch(testClient(t, mux), "o/runner", "shadow/x"))
+}
+
 func TestClosePRAndDeleteBranch(t *testing.T) {
 	closed, deleted := false, false
 	mux := http.NewServeMux()

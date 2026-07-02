@@ -21,6 +21,7 @@ var gatedPackages = []string{
 	"./internal/actions/...",
 	"./internal/noinlinescripts/...",
 	"./internal/shadow/core/...",
+	"./internal/rollout/...",
 }
 
 func main() {

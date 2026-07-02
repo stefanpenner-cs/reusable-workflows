@@ -19,14 +19,23 @@ import (
 var AllowNames = map[string]bool{}
 
 var (
-	exprRe   = regexp.MustCompile(`\$\{\{[^}]*\}\}`)
-	shellOps = regexp.MustCompile("&&|\\|\\||[;|`<>]|\\$\\(")
+	exprRe = regexp.MustCompile(`\$\{\{[^}]*\}\}`)
+	// plainOps: redirection/sequencing/pipes — literal inside single OR double quotes, so checked
+	// on the fully-unquoted view. subOps: command substitution — executes inside double quotes too,
+	// so checked on the single-quote-stripped view (double-quoted content retained).
+	plainOps = regexp.MustCompile(`&&|\|\||[;|<>]`)
+	subOps   = regexp.MustCompile("`|\\$\\(")
 	evalRe   = regexp.MustCompile(`^(node|deno|bun)\s+(-e|--eval|-p|--print)\b`)
 	// Accepted interpreters: bazelisk/bazel (the Go runtime model) + go (dev/CI tooling), plus bash/sh.
 	interpRe = regexp.MustCompile(`^(go|bash|sh|bazelisk|bazel)\s+\S`)
 	bareRe   = regexp.MustCompile(`^\S+\.(mjs|cjs|js|sh)$`)
 	ghScript = regexp.MustCompile(`^actions/github-script@`)
 	flagRe   = regexp.MustCompile(`--\S`) // a long flag (`--name`); the bare `-- ` separator doesn't match
+	// `bash -c`/`sh -c` (incl. short-flag clusters like `-euxc`) and `go generate` are inline logic
+	// dressed as an interpreter invocation — the payload/directives are opaque to shellOps.
+	shellDashCRe = regexp.MustCompile(`^(bash|sh)\b`)
+	dashCFlagRe  = regexp.MustCompile(`^-[a-z]*c([a-z]*)$|^--command$`)
+	goGenerateRe = regexp.MustCompile(`^go\s+generate\b`)
 )
 
 // IsSingleInvocation reports whether value (the fully-folded run: command) is a single external
@@ -36,15 +45,67 @@ func IsSingleInvocation(value string) bool {
 	switch {
 	case v == "":
 		return false
-	case shellOps.MatchString(v):
+	// Shell operators are checked on the UNQUOTED view so a metachar inside a quoted flag value
+	// (`--template='<div>'`) is treated as data, not logic — while an unquoted `>`/`;`/`|` is caught.
+	case plainOps.MatchString(unquoted(v)) || subOps.MatchString(stripSingleQuoted(v)):
 		return false
 	case evalRe.MatchString(v): // inline eval defeats the rule even without shell operators
+		return false
+	case isShellDashC(v): // bash -c / sh -c "..." is inline shell
+		return false
+	case goGenerateRe.MatchString(v): // go generate runs //go:generate directives
 		return false
 	case interpRe.MatchString(v):
 		return true
 	default:
 		return bareRe.MatchString(v)
 	}
+}
+
+// isShellDashC reports whether v is a bash/sh invocation carrying a `-c`/`--command` flag.
+func isShellDashC(v string) bool {
+	if !shellDashCRe.MatchString(v) {
+		return false
+	}
+	for _, tok := range tokenize(v) {
+		if dashCFlagRe.MatchString(tok) {
+			return true
+		}
+	}
+	return false
+}
+
+// unquoted returns v with the contents of single- and double-quoted spans removed, so plain shell
+// operators are only detected outside quotes. Quote characters themselves are dropped.
+func unquoted(v string) string { return strip(v, true, true) }
+
+// stripSingleQuoted removes only single-quoted spans, keeping double-quoted content — command
+// substitution executes inside double quotes, so it must remain visible to subOps.
+func stripSingleQuoted(v string) string { return strip(v, true, false) }
+
+func strip(v string, single, double bool) string {
+	var b strings.Builder
+	inSingle, inDouble := false, false
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c == '\'' && !inDouble:
+			inSingle = !inSingle
+			if !single {
+				b.WriteByte(c)
+			}
+		case c == '"' && !inSingle:
+			inDouble = !inDouble
+			if !double {
+				b.WriteByte(c)
+			}
+		case inSingle && single, inDouble && double:
+			// inside a stripped quote span → drop
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // Violation is a single guard failure: a 1-based line number and a message.

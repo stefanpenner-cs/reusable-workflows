@@ -20,6 +20,10 @@ runs:
     - id: run
       shell: bash
       working-directory: ${{ github.action_path }}
+      # Untrusted inputs travel through env, never interpolated into the run: text (see actions/lint).
+      env:
+        SETUP_PROJECT_NAME: ${{ inputs.project-name }}
+        SETUP_NODE_VERSION: ${{ inputs.node-version }}
       run: bazelisk run //actions/setup --
-        --project-name='${{ inputs.project-name }}'
-        --node-version='${{ inputs.node-version }}'
+        --project-name="$SETUP_PROJECT_NAME"
+        --node-version="$SETUP_NODE_VERSION"

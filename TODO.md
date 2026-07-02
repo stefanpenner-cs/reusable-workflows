@@ -3,6 +3,61 @@
 Backlog for locking this down, refining functionality, and best-in-class DX. Roughly priority-ordered
 within each section; 🔴 = security/correctness, 🟡 = important, 🟢 = nice-to-have.
 
+## Rollout control plane (shipped)
+
+Fleet release/ramp/rollback now lives in [`.github/rollout.json`](.github/rollout.json), operated by
+`rolloutctl` (ramp/promote/rollback/validate/plan) and read at runtime by `shared.yaml`'s two-phase
+checkout via `//rollout/cmd/resolve`. Runbook: [`ROLLOUT.md`](ROLLOUT.md). Follow-ups:
+
+- 🟡 CI gate: `rolloutctl validate` on `rollout.json` in `test.yaml` (reject invalid/non-canonical).
+- 🟡 Auto-drive `plan` off the real fleet list (not just `shadow-consumers.json`).
+- 🟢 Time-boxed auto-ramp (advance % on a schedule if the cohort's CI is green).
+- 🟢 Per-channel required-reviewer gate on manifest commits (CODEOWNERS on `rollout.json`).
+
+## Fixed in the adversarial-review pass
+
+- 🔴 **Composite-action arg injection** — inputs now travel through `env:` and are referenced as
+  `"$VAR"`, never interpolated into the `run:` text (`actions/{lint,test,setup}`).
+- 🔴 **`no-inline-scripts` bypass** — `bash -c`/`sh -c` and `go generate` are now rejected; the
+  shell-operator check is quote-aware (no more false positives on `--x='<div>'`).
+- 🔴 **`$GITHUB_OUTPUT` injection** — `RenderOutputs` rejects keys with `\n`/`=`/`<` and emits
+  heredoc (collision-proof delimiter) for multiline values.
+- 🔴 **Shadow watcher false PASS** — `watchCommitRun` now awaits *every* run for the commit, not
+  `runs[0]`; a case-mismatched `uses:` repo is repointed (`EqualFold`).
+- 🔴 **Shadow false FAIL at scale** — `awaitRun`/`watchCommitRun` retry rate-limit/5xx/transport
+  errors with reset-aware backoff; every API call has a 30s timeout; permanent errors (401) surface
+  instead of masquerading as timeouts.
+- 🔴 **Cleanup silently leaked** — `closePRAndDeleteBranch` no longer swallows auth/rate errors
+  (only 404/422 already-gone).
+- 🟡 **`ensurePR` TOCTOU** — 422 already-exists re-fetches the winner's PR instead of false-failing.
+- 🟡 **`MirrorTree`** — preserves exec bits and recreates symlinks (was 0644 + deref-crash).
+- 🟡 **Anchored `with:`** — `with: *anchor` keeps its inputs on repoint (was wiped).
+- 🟡 **`repoRe`** tightened to `[A-Za-z0-9._-]` (was `[^/\s]`, a metachar sink).
+- 🟡 **Matrix cap** — `list-consumers` fails loudly past GitHub's 256-job limit.
+- 🟡 **`shared.yaml` fail-open** removed — no more `${{ inputs.ref || 'main' }}`; resolve fails loud.
+- 🟡 **`permissions: contents: read`** added to `shared.yaml`/`ci.yaml`/`test.yaml`.
+
+## Remaining from the adversarial review
+
+- 🟡 **Shadow watcher timeout budgets are inverted** — outer `WatchRun` (900s) < inner
+  find+await worst case (~1100s + clones); a slow-but-passing consumer false-fails. Extract the
+  budgets and assert outer > inner + overhead (`internal/shadow/adapters/github.go`).
+- 🟡 **Cleanup only tears down branches derivable from the *current* consumers file** — a consumer
+  removed from the file on the same PR leaks its shadow PR/branch. List runner branches by prefix
+  `shadow/pr-<n>-` (paginated) and delete those.
+- 🟡 **`strconv.Atoi` on `workflows-pr` ignored** → `shadow/pr-0-*` branches on the cleanup /
+  dispatch paths (only `resolve-ctx` guards it). Validate numeric in core.
+- 🟢 **Token in clone URL** leaks into git/exec error strings (`git.go`/`exec.go`) — masked in
+  Actions logs, not elsewhere.
+- 🟢 **`CloneShallow` can't take a SHA** though `ParseConsumers` accepts one as `ref`.
+- 🟢 **`cancel-in-progress` can orphan** a runner-side shadow PR (self-heals on close; consider a
+  cancel trap or `cancel-in-progress: false` for the privileged matrix).
+- 🟢 **`uses:`/`on:` alias nodes** in a consumer workflow are skipped (rare); resolve or error.
+- 🟢 **Deterministic-SHA rerun** re-reports a stale failed run for an unchanged head (document the
+  flake-recovery path).
+- 🟢 **Manual `workflow_dispatch` of shadow** has no "I reviewed this head" gate the label implies —
+  note in `shadow/SECURITY.md`.
+
 ## Secrets → OIDC only 🔴
 
 Eliminate the long-lived `SHADOW_PAT` — per [`shadow/SECURITY.md`](shadow/SECURITY.md) it's the
